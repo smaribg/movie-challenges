@@ -41,7 +41,8 @@ const posterHtml = (f, size = "w342") => posterOf(f) ? `<img src="${IMG + size +
 
 // ---------- State ----------
 let sb = null, user = null;
-let tmdbToken = null;
+let tmdbToken = null;          // your own key, if you saved one; otherwise calls go through the Supabase function
+let tmdbReady = false;
 let directors = [];            // rows from Supabase plus .films (loaded from TMDB) and .error
 let challenges = [], challengesErr = "";   // decade challenges; the error is set when the table is missing
 const entries = new Map();     // movie_id -> {watched, note}
@@ -55,11 +56,17 @@ const tmdbQueue = [];
 const tmdbSlot = () => tmdbBusy < 6 ? (tmdbBusy++, Promise.resolve()) : new Promise(r => tmdbQueue.push(r));
 const tmdbFree = () => { const next = tmdbQueue.shift(); next ? next() : tmdbBusy--; };
 async function tmdb(path, params = {}) {
-  const u = new URL("https://api.themoviedb.org/3" + path);
-  const v3 = /^[0-9a-f]{32}$/i.test(tmdbToken);
+  // Without a key of your own, the site's Supabase function (supabase/functions/tmdb) calls TMDB with the shared key.
+  const proxy = !tmdbToken;
+  const u = new URL(proxy ? window.DR_CONFIG.supabaseUrl + "/functions/v1/tmdb" + path : "https://api.themoviedb.org/3" + path);
+  const v3 = !proxy && /^[0-9a-f]{32}$/i.test(tmdbToken);
   if (v3) u.searchParams.set("api_key", tmdbToken);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
-  const headers = v3 ? { accept: "application/json" } : { accept: "application/json", Authorization: "Bearer " + tmdbToken };
+  const headers = { accept: "application/json" };
+  if (proxy) {
+    headers.apikey = window.DR_CONFIG.supabaseAnonKey;
+    headers.Authorization = "Bearer " + (await sb.auth.getSession()).data.session?.access_token;
+  } else if (!v3) headers.Authorization = "Bearer " + tmdbToken;
   let res;
   // TMDB rate-limits bursts (many directors loading at once), and its 429s often arrive without CORS headers,
   // so they surface as network errors. Keep few requests in flight and retry either kind.
@@ -238,10 +245,11 @@ async function moveDirector(id, delta) {
     : "Couldn't save the order. " + error.message);
 }
 
-// First run: bring over the three directors from the old page, with Perfect Blue watched.
+// First run: start new users off with three directors.
 async function seedIfNeeded(settings) {
-  if (settings.seeded) return;
-  await sb.from("settings").update({ seeded: true }).eq("user_id", user.id);
+  if (settings?.seeded) return;
+  // New users on the shared TMDB key have no settings row yet, so create it.
+  await sb.from("settings").upsert({ user_id: user.id, seeded: true });
   if (directors.length) return;
   const people = await Promise.all(["Paul Thomas Anderson", "Joel Coen", "Ethan Coen", "Satoshi Kon"].map(findDirector));
   const rows = [];
@@ -249,10 +257,6 @@ async function seedIfNeeded(settings) {
   if (people[1] && people[2]) rows.push({ name: "Coen Brothers", person_ids: [people[1].id, people[2].id] });
   if (people[3]) rows.push({ name: "Satoshi Kon", person_ids: [people[3].id] });
   for (const r of rows) await sb.from("directors").insert(r);
-  if (people[3]) {
-    const pb = (await loadFilms([people[3].id])).find(f => f.t === "Perfect Blue");
-    if (pb) await sb.from("entries").upsert({ user_id: user.id, movie_id: pb.id, watched: true, note: "" });
-  }
 }
 
 // Prefer an exact name match who works as a director; TMDB's search is fuzzy and
@@ -1328,8 +1332,10 @@ function screenToken(msg = "") {
 async function start() {
   const { data: settings, error } = await sb.from("settings").select("*").eq("user_id", user.id).maybeSingle();
   if (error) return showScreen(`<section class="panel"><h2>Database not set up</h2><p>Run <code>supabase/setup.sql</code> in the Supabase SQL editor, then reload. (${esc(error.message)})</p></section>`);
-  if (!settings?.tmdb_token) return screenToken();
-  tmdbToken = settings.tmdb_token;
+  tmdbToken = settings?.tmdb_token || null;
+  // No key of your own: use the shared one through the Supabase function, or ask for a key if that isn't set up.
+  if (!tmdbToken) { try { await tmdb("/configuration"); } catch { return screenToken(); } }
+  tmdbReady = true;
   showScreen("");
   $("cards").innerHTML = `<div class="empty"><strong>Loading your directors…</strong>Fetching your list.</div>`;
   try { await loadData(); await seedIfNeeded(settings); await loadData(); }
@@ -1486,7 +1492,7 @@ dragScroll($("cards"));
 dragScroll($("decCards"));
 addEventListener("resize", updateNav);
 // Pick up changes made on another device when you come back to this tab.
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && user && tmdbToken && !open && !tier && !slot) loadData().catch(() => {}); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && user && tmdbReady && !open && !tier && !slot) loadData().catch(() => {}); });
 
 // ---------- Boot ----------
 (async () => {
